@@ -21,19 +21,123 @@ package generator
 
 import (
 	"bytes"
+	"fmt"
+	"io/ioutil"
+	"os"
+	"sort"
 	"strings"
+
+	"golang.org/x/tools/imports"
 )
+
+// importsOptions is the same as x/tools/cmd/goimports options except Fragment.
+var importsOptions = &imports.Options{
+	TabWidth:  8,
+	TabIndent: true,
+	Comments:  true,
+}
+
+type FileBuffer struct {
+	FileName string
+	BaseName string
+
+	Header []byte
+	Chunks []*TBuf
+
+	TempDir      string
+	TempFilePath string
+}
+
+func (f *FileBuffer) WriteTempFile() error {
+	file, err := ioutil.TempFile(f.TempDir, fmt.Sprintf("%s_*", f.BaseName))
+	if err != nil {
+		return fmt.Errorf("failed to create temp file for %s: %v", f.BaseName, err)
+	}
+
+	if err := f.writeChunks(file); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("failed to write temp file for %s: %v", f.BaseName, err)
+	}
+
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("failed to close file for %s: %v", f.BaseName, err)
+	}
+
+	f.TempFilePath = file.Name()
+	return nil
+}
+
+func (f *FileBuffer) writeChunks(file *os.File) error {
+	// write a header to the file
+	if _, err := file.Write(f.Header); err != nil {
+		return err
+	}
+
+	chunks := TBufSlice(f.Chunks)
+
+	// sort chunks
+	sort.Sort(chunks)
+
+	// write chunks to the file in order
+	for i, chunk := range chunks {
+		// add new line between chunks
+		if i != 0 {
+			_, _ = file.Write([]byte("\n"))
+		}
+
+		// check if generated template is only whitespace/empty
+		bufStr := strings.TrimSpace(chunk.Buf.String())
+		if len(bufStr) == 0 {
+			continue
+		}
+
+		if _, err := chunk.Buf.WriteTo(file); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (f *FileBuffer) Postprocess(disableFormat bool) error {
+	if !disableFormat {
+		// run gofmt for the temp file
+		formatted, err := imports.Process(f.TempFilePath, nil, importsOptions)
+		if err != nil {
+			return fmt.Errorf("failed to fmt file for %s: %v", f.BaseName, err)
+		}
+
+		// overwrite the tempfile by gofmt result
+		// since abs file exists, set perm to 0
+		if err := ioutil.WriteFile(f.TempFilePath, formatted, 0); err != nil {
+			return fmt.Errorf("failed to formatted file for %s: %v", f.BaseName, err)
+		}
+	}
+
+	// change permission
+	if err := os.Chmod(f.TempFilePath, 0666); err != nil {
+		return fmt.Errorf("failed to change file permission for %s: %v", f.BaseName, err)
+	}
+
+	return nil
+}
+
+func (f *FileBuffer) Finalize() error {
+	if err := os.Rename(f.TempFilePath, f.FileName); err != nil {
+		return fmt.Errorf("failed to put file for %s: %v", f.BaseName, err)
+	}
+
+	return nil
+}
 
 // TBuf is to hold the executed templates.
 type TBuf struct {
-	TemplateType TemplateType
-	Name         string
-	Subname      string
-	Buf          *bytes.Buffer
+	Name string
+	Buf  *bytes.Buffer
 }
 
 // TBufSlice is a slice of TBuf compatible with sort.Interface.
-type TBufSlice []TBuf
+type TBufSlice []*TBuf
 
 func (t TBufSlice) Len() int {
 	return len(t)
@@ -44,17 +148,5 @@ func (t TBufSlice) Swap(i, j int) {
 }
 
 func (t TBufSlice) Less(i, j int) bool {
-	if t[i].TemplateType < t[j].TemplateType {
-		return true
-	} else if t[j].TemplateType < t[i].TemplateType {
-		return false
-	}
-
-	if strings.Compare(t[i].Name, t[j].Name) < 0 {
-		return true
-	} else if strings.Compare(t[j].Name, t[i].Name) < 0 {
-		return false
-	}
-
-	return strings.Compare(t[i].Subname, t[j].Subname) < 0
+	return strings.Compare(t[i].Name, t[j].Name) < 0
 }

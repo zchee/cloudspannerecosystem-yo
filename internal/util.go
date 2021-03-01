@@ -51,8 +51,17 @@ func SingularizeIdentifier(in Inflector, s string) string {
 		s = in.Singularize(s)
 	}
 
-	// return snaker.SnakeToCamelIdentifier(s)
 	return snaker.ForceCamelIdentifier(s)
+}
+
+// SnakeToCamel converts the string to CamelCase
+func SnakeToCamel(s string) string {
+	return snaker.ForceCamelIdentifier(s)
+}
+
+// CamelToSnake converts the string to snake_case
+func CamelToScake(s string) string {
+	return snaker.CamelToSnakeIdentifier(s)
 }
 
 // EscapeColumnName will escape a column name if using reserved keyword as column name, returning it in

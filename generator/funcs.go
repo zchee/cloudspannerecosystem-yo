@@ -27,38 +27,33 @@ import (
 
 	"github.com/kenshaw/snaker"
 
-	"go.mercari.io/yo/internal"
-	"go.mercari.io/yo/models"
+	"go.mercari.io/yo/v2/internal"
+	"go.mercari.io/yo/v2/models"
 )
 
 // newTemplateFuncs returns a set of template funcs bound to the supplied args.
 func (a *Generator) newTemplateFuncs() template.FuncMap {
 	return template.FuncMap{
-		"colcount":          a.colcount,
-		"columncount":       a.columncount,
-		"colnames":          a.colnames,
-		"escapedcolnames":   a.escapedcolnames,
-		"colnamesquery":     a.colnamesquery,
-		"colprefixnames":    a.colprefixnames,
-		"colvals":           a.colvals,
-		"fieldnames":        a.fieldnames,
-		"goparamlist":       a.goparamlist,
-		"gocustomparamlist": a.gocustomparamlist,
-		"reniltype":         a.reniltype,
-		"retype":            a.retype,
-		"shortname":         a.shortname,
-		"goconvert":         a.goconvert,
-		"colname":           a.colname,
-		"escapedcolname":    a.escapedcolname,
-		"hascolumn":         a.hascolumn,
-		"hasfield":          a.hasfield,
-		"getstartcount":     a.getstartcount,
-		"customfieldcount":  a.customfieldcount,
-		"goparamname":       a.goparamname,
-		"customtypeparam":   a.customtypeparam,
-		"tolower":           a.tolower,
-		"nullcheck":         a.nullcheck,
-		"pluralize":         a.pluralize,
+		"filterFields": a.filterFields,
+		"shortName":    a.shortName,
+		"nullcheck":    a.nullcheck,
+
+		"hasColumn":         a.hasColumn,
+		"columnNames":       a.columnNames,
+		"columnNamesQuery":  a.columnNamesQuery,
+		"columnPrefixNames": a.columnPrefixNames,
+
+		"hasField":   a.hasField,
+		"fieldNames": a.fieldNames,
+
+		"goParam":         a.goParam,
+		"goEncodedParam":  a.goEncodedParam,
+		"goParams":        a.goParams,
+		"goEncodedParams": a.goEncodedParams,
+
+		"escape":    a.escape,
+		"toLower":   a.toLower,
+		"pluralize": a.pluralize,
 	}
 }
 
@@ -69,7 +64,7 @@ func ignoreFromMultiTypes(ignoreNames []interface{}) map[string]bool {
 		case string:
 			ignore[k] = true
 
-		case []*internal.Field:
+		case []*models.Field:
 			for _, f := range k {
 				ignore[f.Name] = true
 			}
@@ -79,55 +74,61 @@ func ignoreFromMultiTypes(ignoreNames []interface{}) map[string]bool {
 	return ignore
 }
 
-// retype checks typ against known types, and prefixing
-// customTypePackage (if applicable).
-func (a *Generator) retype(typ string) string {
-	if strings.Contains(typ, ".") {
-		return typ
-	}
+func (a *Generator) filterFields(fields []*models.Field, ignoreNames ...interface{}) []*models.Field {
+	ignore := ignoreFromMultiTypes(ignoreNames)
 
-	prefix := ""
-	for strings.HasPrefix(typ, "[]") {
-		typ = typ[2:]
-		prefix = prefix + "[]"
-	}
-
-	if _, ok := KnownTypeMap[typ]; !ok {
-		pkg := a.customTypePackage
-		if pkg != "" {
-			pkg = pkg + "."
+	filtered := make([]*models.Field, 0, len(fields))
+	for _, f := range fields {
+		if ignore[f.Name] {
+			continue
 		}
-
-		return prefix + pkg + typ
+		filtered = append(filtered, f)
 	}
 
-	return prefix + typ
+	return filtered
 }
 
-// reniltype checks typ against known nil types (similar to retype), prefixing
-// customTypePackage (if applicable).
-func (a *Generator) reniltype(typ string) string {
-	if strings.Contains(typ, ".") {
-		return typ
-	}
-
-	if strings.HasSuffix(typ, "{}") {
-		if _, ok := KnownTypeMap[typ[:len(typ)-2]]; ok {
-			return typ
+// columnNames creates a list of the column names found in fields.
+//
+// When escaped is true, if the column name is a reserved word, it's escaped with backquotes.
+//
+// Used to present a comma separated list of column names, that can be used in
+// a SELECT, or UPDATE, or other SQL clause requiring an list of identifiers
+// (ie, "field_1, field_2, field_3, ...").
+func (a *Generator) columnNames(fields []*models.Field) string {
+	str := ""
+	i := 0
+	for _, f := range fields {
+		if i != 0 {
+			str = str + ", "
 		}
-
-		pkg := a.customTypePackage
-		if pkg != "" {
-			pkg = pkg + "."
-		}
-
-		return pkg + typ
+		str = str + internal.EscapeColumnName(f.ColumnName)
+		i++
 	}
-
-	return typ
+	return str
 }
 
-// shortname generates a safe Go identifier for typ. typ is first checked
+// columnNamesQuery creates a list of the column names in fields as a query and
+// joined by sep, excluding any models.Field with Name contained in ignoreNames.
+//
+// Used to create a list of column names in a WHERE clause (ie, "field_1 = $1
+// AND field_2 = $2 AND ...") or in an UPDATE clause (ie, "field = $1, field =
+// $2, ...").
+func (a *Generator) columnNamesQuery(fields []*models.Field, sep string) string {
+	str := ""
+	i := 0
+	for _, f := range fields {
+		if i != 0 {
+			str = str + sep
+		}
+		str = str + internal.EscapeColumnName(f.ColumnName) + " = " + a.loader.NthParam(i)
+		i++
+	}
+
+	return str
+}
+
+// shortName generates a safe Go identifier for typ. typ is first checked
 // against ShortNameTypeMap, and if not found, then the value is
 // calculated and stored in the ShortNameTypeMap for future use.
 //
@@ -141,8 +142,8 @@ func (a *Generator) reniltype(typ string) string {
 // Generated shortnames that have conflicts with any scopeConflicts member will
 // have nameConflictSuffix appended.
 //
-// Note: recognized types for scopeConflicts are string, []*internal.Field.
-func (a *Generator) shortname(typ string, scopeConflicts ...interface{}) string {
+// Note: recognized types for scopeConflicts are string, []*models.Field.
+func (a *Generator) shortName(typ string, scopeConflicts ...interface{}) string {
 	var v string
 	var ok bool
 
@@ -174,7 +175,7 @@ func (a *Generator) shortname(typ string, scopeConflicts ...interface{}) string 
 				v = v + a.nameConflictSuffix
 			}
 
-		case []*internal.Field:
+		case []*models.Field:
 			for _, f := range k {
 				if f.Name == v {
 					v = v + a.nameConflictSuffix
@@ -182,7 +183,7 @@ func (a *Generator) shortname(typ string, scopeConflicts ...interface{}) string 
 			}
 
 		default:
-			panic("shortname: supported type")
+			panic("shortName: supported type")
 		}
 	}
 
@@ -194,195 +195,43 @@ func (a *Generator) shortname(typ string, scopeConflicts ...interface{}) string 
 	return v
 }
 
-// colnames creates a list of the column names found in fields, excluding any
-// internal.Field with Name contained in ignoreNames.
-//
-// Used to present a comma separated list of column names, that can be used in
-// a SELECT, or UPDATE, or other SQL clause requiring an list of identifiers
-// (ie, "field_1, field_2, field_3, ...").
-func (a *Generator) colnames(fields []*internal.Field, ignoreNames ...interface{}) string {
-	ignore := ignoreFromMultiTypes(ignoreNames)
-
-	str := ""
-	i := 0
-	for _, f := range fields {
-		if ignore[f.Name] {
-			continue
-		}
-
-		if i != 0 {
-			str = str + ", "
-		}
-		str = str + a.colname(f.Col)
-		i++
-	}
-	return str
-}
-
-// escapedcolnames creates a list of the column names found in the field, excluding any
-// internal.Field with Name contained in ignoreNames.
-// If use reserved word as a column name, it is escaped by surrounding it with backquotes.
-//
-// Used to present a comma separated list of espcaped column names, that can be used in
-// a SELECT, or UPDATE, or other SQL clause requiring an list of identifiers
-// (ie, "field_1, field_2, field_3, ...").
-func (a *Generator) escapedcolnames(fields []*internal.Field, ignoreNames ...interface{}) string {
-	ignore := ignoreFromMultiTypes(ignoreNames)
-
-	str := ""
-	i := 0
-	for _, f := range fields {
-		if ignore[f.Name] {
-			continue
-		}
-
-		if i != 0 {
-			str = str + ", "
-		}
-		str = str + internal.EscapeColumnName(a.colname(f.Col))
-		i++
-	}
-	return str
-}
-
-// colnamesquery creates a list of the column names in fields as a query and
-// joined by sep, excluding any internal.Field with Name contained in ignoreNames.
-//
-// Used to create a list of column names in a WHERE clause (ie, "field_1 = $1
-// AND field_2 = $2 AND ...") or in an UPDATE clause (ie, "field = $1, field =
-// $2, ...").
-func (a *Generator) colnamesquery(fields []*internal.Field, sep string, ignoreNames ...interface{}) string {
-	ignore := ignoreFromMultiTypes(ignoreNames)
-
-	str := ""
-	i := 0
-	for _, f := range fields {
-		if ignore[f.Name] {
-			continue
-		}
-
-		if i != 0 {
-			str = str + sep
-		}
-		str = str + internal.EscapeColumnName(a.colname(f.Col)) + " = " + a.loader.NthParam(i)
-		i++
-	}
-
-	return str
-}
-
-// colprefixnames creates a list of the column names found in fields with the
-// supplied prefix, excluding any internal.Field with Name contained in ignoreNames.
+// columnPrefixNames creates a list of the column names found in fields with the
+// supplied prefix.
 //
 // Used to present a comma separated list of column names with a prefix. Used in
 // a SELECT, or UPDATE (ie, "t.field_1, t.field_2, t.field_3, ...").
-func (a *Generator) colprefixnames(fields []*internal.Field, prefix string, ignoreNames ...interface{}) string {
-	ignore := ignoreFromMultiTypes(ignoreNames)
-
+func (a *Generator) columnPrefixNames(fields []*models.Field, prefix string) string {
 	str := ""
 	i := 0
 	for _, f := range fields {
-		if ignore[f.Name] {
-			continue
-		}
-
 		if i != 0 {
 			str = str + ", "
 		}
-		str = str + prefix + "." + a.colname(f.Col)
+		str = str + prefix + "." + internal.EscapeColumnName(f.ColumnName)
 		i++
 	}
 
 	return str
 }
 
-// colvals creates a list of value place holders for fields excluding any internal.Field
-// with Name contained in ignoreNames.
-//
-// Used to present a comma separated list of column place holders, used in a
-// SELECT or UPDATE statement (ie, "$1, $2, $3 ...").
-func (a *Generator) colvals(fields []*internal.Field, ignoreNames ...interface{}) string {
-	ignore := ignoreFromMultiTypes(ignoreNames)
-
-	str := ""
-	i := 0
-	for _, f := range fields {
-		if ignore[f.Name] {
-			continue
-		}
-
-		if i != 0 {
-			str = str + ", "
-		}
-		str = str + a.loader.NthParam(i)
-		i++
-	}
-
-	return str
-}
-
-// fieldnames creates a list of field names from fields of the adding the
-// provided prefix, and excluding any internal.Field with Name contained in ignoreNames.
+// fieldNames creates a list of field names from fields of the adding the
+// provided prefix, and excluding any models.Field with Name contained in ignoreNames.
 //
 // Used to present a comma separated list of field names, ie in a Go statement
 // (ie, "t.Field1, t.Field2, t.Field3 ...")
-func (a *Generator) fieldnames(fields []*internal.Field, prefix string, ignoreNames ...interface{}) string {
-	ignore := ignoreFromMultiTypes(ignoreNames)
-
+func (a *Generator) fieldNames(fields []*models.Field, prefix string) string {
 	str := ""
 	i := 0
 	for _, f := range fields {
-		if ignore[f.Name] {
-			continue
-		}
-
 		if i != 0 {
 			str = str + ", "
 		}
 
-		if f.CustomType != "" {
-			str = str + f.Type + "(" + prefix + "." + f.Name + ")"
-		} else {
-			str = str + prefix + "." + f.Name
-		}
+		str = str + prefix + "." + f.Name
 		i++
 	}
 
 	return str
-}
-
-// colcount returns the 1-based count of fields, excluding any internal.Field with Name
-// contained in ignoreNames.
-//
-// Used to get the count of fields, and useful for specifying the last SQL
-// parameter.
-func (a *Generator) colcount(fields []*internal.Field, ignoreNames ...interface{}) int {
-	ignore := ignoreFromMultiTypes(ignoreNames)
-
-	i := 1
-	for _, f := range fields {
-		if ignore[f.Name] {
-			continue
-		}
-
-		i++
-	}
-	return i
-}
-
-// columncount returns the number of fields
-func (a *Generator) columncount(fields []*internal.Field, ignoreNames ...interface{}) int {
-	ignore := ignoreFromMultiTypes(ignoreNames)
-
-	i := 0
-	for _, f := range fields {
-		if ignore[f.Name] {
-			continue
-		}
-
-		i++
-	}
-	return i
 }
 
 // goReservedNames is a map of of go reserved names to "safe" names.
@@ -436,179 +285,8 @@ var goReservedNames = map[string]string{
 	"complex128": "c128",
 }
 
-// goparamlist converts a list of fields into their named Go parameters,
-// skipping any internal.Field with Name contained in ignoreNames. addType will cause
-// the go Type to be added after each variable name. addPrefix will cause the
-// returned string to be prefixed with ", " if the generated string is not
-// empty.
-//
-// Any field name encountered will be checked against goReservedNames, and will
-// have its name substituted by its corresponding looked up value.
-//
-// Used to present a comma separated list of Go variable names for use with as
-// either a Go func parameter list, or in a call to another Go func.
-// (ie, ", a, b, c, ..." or ", a T1, b T2, c T3, ...").
-func (a *Generator) goparamlist(fields []*internal.Field, addPrefix bool, addType bool, ignoreNames ...interface{}) string {
-	ignore := ignoreFromMultiTypes(ignoreNames)
-
-	i := 0
-	vals := []string{}
-	for _, f := range fields {
-		if ignore[f.Name] {
-			continue
-		}
-
-		s := "v" + strconv.Itoa(i)
-		if len(f.Name) > 0 {
-			s = a.goparamname(f.Name)
-		}
-
-		// add the go type
-		if addType {
-			s += " " + a.retype(f.Type)
-		}
-
-		// add to vals
-		vals = append(vals, s)
-
-		i++
-	}
-
-	// concat generated values
-	str := strings.Join(vals, ", ")
-	if addPrefix && str != "" {
-		return ", " + str
-	}
-
-	return str
-}
-
-// gocustomparamlist is a similar function like goparamlist
-// which converts a list of fields into their named Go parameters
-// and also do custom type conversion
-func (a *Generator) gocustomparamlist(fields []*internal.Field, addPrefix bool, addType bool, ignoreNames ...interface{}) string {
-	ignore := ignoreFromMultiTypes(ignoreNames)
-
-	i := 0
-	vals := []string{}
-	for _, f := range fields {
-		if ignore[f.Name] {
-			continue
-		}
-
-		s := "v" + strconv.Itoa(i)
-		if len(f.Name) > 0 {
-			s = a.goparamname(f.Name)
-		}
-
-		// add the go type
-		if addType {
-			if f.CustomType != "" {
-				s += " " + a.retype(f.CustomType)
-			} else {
-				s += " " + a.retype(f.Type)
-			}
-		} else {
-			// raw type conversion for custom type
-			if f.CustomType != "" {
-				s = a.retype(f.Type) + "(" + s + ")"
-			}
-		}
-
-		// add to vals
-		vals = append(vals, s)
-
-		i++
-	}
-
-	// concat generated values
-	str := strings.Join(vals, ", ")
-	if addPrefix && str != "" {
-		return ", " + str
-	}
-
-	return str
-}
-
-// goconvert generates the Go conversion for f in order for it
-// to be assignable to t
-func (a *Generator) goconvert(prefix string, f *internal.Field, t *internal.Field) string {
-	expr := prefix + "." + f.Name
-	if f.Type == t.Type {
-		return expr
-	}
-
-	ft := f.Type
-	if strings.HasPrefix(ft, "sql.Null") {
-		expr = expr + "." + f.Type[8:]
-		ft = strings.ToLower(f.Type[8:])
-	}
-
-	if t.Type != ft {
-		expr = t.Type + "(" + expr + ")"
-	}
-
-	return expr
-}
-
-// colname returns the ColumnName of col.
-func (a *Generator) colname(col *models.Column) string {
-	return col.ColumnName
-}
-
-// escapedcolname returns the ColumnName of col. It is escaped for query.
-func (a *Generator) escapedcolname(col *models.Column) string {
-	return internal.EscapeColumnName(col.ColumnName)
-}
-
-// hascolumn takes a list of fields and determines if field with the specified
-// column name is in the list.
-func (a *Generator) hascolumn(fields []*internal.Field, name string) bool {
-	for _, f := range fields {
-		if f.Col.ColumnName == name {
-			return true
-		}
-	}
-
-	return false
-}
-
-// hasfield takes a list of fields and determines if field with the specified
-// field name is in the list.
-func (a *Generator) hasfield(fields []*internal.Field, name string) bool {
-	for _, f := range fields {
-		if f.Name == name {
-			return true
-		}
-	}
-
-	return false
-}
-
-// getstartcount returns a starting count for numbering columsn in queries
-func (a *Generator) getstartcount(fields []*internal.Field, pkFields []*internal.Field) int {
-	return len(fields) - len(pkFields)
-}
-
-// customfieldcount returns the number of field has custom type
-func (a *Generator) customfieldcount(fields []*internal.Field) int {
-	count := 0
-	for _, f := range fields {
-		if f.CustomType != "" {
-			count++
-		}
-	}
-
-	return count
-}
-
-// customtypeparam returns temporary custom field variable name with prefix c
-func (a *Generator) customtypeparam(name string) string {
-	return "c" + name
-}
-
-// goparamname make the first word of name to lowercase
-func (a *Generator) goparamname(name string) string {
+// goParam make the first word of name to lowercase
+func (a *Generator) goParam(name string) string {
 	ns := strings.Split(snaker.CamelToSnake(name), "_")
 	name = strings.ToLower(ns[0]) + name[len(ns[0]):]
 
@@ -620,14 +298,103 @@ func (a *Generator) goparamname(name string) string {
 	return name
 }
 
-// tolower converts s to lower case.
-func (a *Generator) tolower(s string) string {
-	return strings.ToLower(s)
+// goEncodedParam make the first word of name to lowercase
+func (a *Generator) goEncodedParam(name string) string {
+	return fmt.Sprintf("yoEncode(%s)", a.goParam(name))
+}
+
+// goParams converts a list of fields into their named Go parameters,
+// skipping any models.Field with Name contained in ignoreNames. addType will cause
+// the go Type to be added after each variable name. addPrefix will cause the
+// returned string to be prefixed with ", " if the generated string is not
+// empty.
+//
+// Any field name encountered will be checked against goReservedNames, and will
+// have its name substituted by its corresponding looked up value.
+//
+// Used to present a comma separated list of Go variable names for use with as
+// either a Go func parameter list, or in a call to another Go func.
+// (ie, ", a, b, c, ..." or ", a T1, b T2, c T3, ...").
+func (a *Generator) goParams(fields []*models.Field, addPrefix bool, addType bool) string {
+	i := 0
+	vals := []string{}
+	for _, f := range fields {
+		s := "v" + strconv.Itoa(i)
+		if len(f.Name) > 0 {
+			s = a.goParam(f.Name)
+		}
+
+		// add the go type
+		if addType {
+			s += " " + f.Type
+		}
+
+		// add to vals
+		vals = append(vals, s)
+
+		i++
+	}
+
+	// concat generated values
+	str := strings.Join(vals, ", ")
+	if addPrefix && str != "" {
+		return ", " + str
+	}
+
+	return str
+}
+
+func (a *Generator) goEncodedParams(fields []*models.Field, addPrefix bool) string {
+	i := 0
+	vals := []string{}
+	for _, f := range fields {
+		s := "v" + strconv.Itoa(i)
+		if len(f.Name) > 0 {
+			s = a.goParam(f.Name)
+		}
+
+		// add to vals
+		vals = append(vals, fmt.Sprintf("yoEncode(%s)", s))
+
+		i++
+	}
+
+	// concat generated values
+	str := strings.Join(vals, ", ")
+	if addPrefix && str != "" {
+		return ", " + str
+	}
+
+	return str
+}
+
+// hascolumn takes a list of fields and determines if field with the specified
+// column name is in the list.
+func (a *Generator) hasColumn(fields []*models.Field, name string) bool {
+	for _, f := range fields {
+		if f.ColumnName == name {
+			return true
+		}
+	}
+
+	return false
+}
+
+// hasfield takes a list of fields and determines if field with the specified
+// field name is in the list.
+func (a *Generator) hasField(fields []*models.Field, name string) bool {
+	for _, f := range fields {
+		if f.Name == name {
+			return true
+		}
+	}
+
+	return false
 }
 
 // nullcheck generates a code to check the field value is null.
-func (a *Generator) nullcheck(field *internal.Field) string {
-	paramName := a.goparamname(field.Name)
+func (a *Generator) nullcheck(field *models.Field) string {
+	paramName := a.goParam(field.Name)
 
 	switch field.Type {
 	case "spanner.NullInt64",
@@ -640,6 +407,16 @@ func (a *Generator) nullcheck(field *internal.Field) string {
 	}
 
 	return fmt.Sprintf("yo, ok := %s.(yoIsNull); ok && yo.IsNull()", paramName)
+}
+
+// escaped returns the ColumnName of col. It is escaped for query.
+func (a *Generator) escape(col string) string {
+	return internal.EscapeColumnName(col)
+}
+
+// toLower converts s to lower case.
+func (a *Generator) toLower(s string) string {
+	return strings.ToLower(s)
 }
 
 // pluralize converts s to plural.

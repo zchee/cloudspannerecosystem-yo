@@ -21,20 +21,14 @@ package generator
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"path"
-	"path/filepath"
-	"sort"
-	"strings"
-	"text/template"
 
-	"golang.org/x/tools/imports"
-
-	"go.mercari.io/yo/internal"
-	templates "go.mercari.io/yo/tplbin"
+	"go.mercari.io/yo/v2/internal"
+	"go.mercari.io/yo/v2/models"
+	"go.mercari.io/yo/v2/module"
 )
 
 // Loader is the common interface for database drivers that can generate code
@@ -45,224 +39,140 @@ type Loader interface {
 }
 
 type GeneratorOption struct {
-	PackageName       string
-	Tags              string
-	TemplatePath      string
-	CustomTypePackage string
-	FilenameSuffix    string
-	SingleFile        bool
-	Filename          string
-	Path              string
+	PackageName    string
+	Tags           string
+	FilenameSuffix string
+	BaseDir        string
+	DisableFormat  bool
+
+	HeaderModule  module.Module
+	GlobalModules []module.Module
+	TypeModules   []module.Module
 }
 
 func NewGenerator(loader Loader, inflector internal.Inflector, opt GeneratorOption) *Generator {
 	return &Generator{
-		loader:             loader,
-		inflector:          inflector,
-		templatePath:       opt.TemplatePath,
+		loader:         loader,
+		inflector:      inflector,
+		packageName:    opt.PackageName,
+		tags:           opt.Tags,
+		filenameSuffix: opt.FilenameSuffix,
+		baseDir:        opt.BaseDir,
+		disableFormat:  opt.DisableFormat,
+
+		headerModule:  opt.HeaderModule,
+		globalModules: opt.GlobalModules,
+		typeModules:   opt.TypeModules,
+
+		files:              make(map[string]*FileBuffer),
 		nameConflictSuffix: "z",
-		packageName:        opt.PackageName,
-		tags:               opt.Tags,
-		customTypePackage:  opt.CustomTypePackage,
-		filenameSuffix:     opt.FilenameSuffix,
-		singleFile:         opt.SingleFile,
-		filename:           opt.Filename,
-		path:               opt.Path,
-		files:              make(map[string]*os.File),
 	}
 }
 
 type Generator struct {
-	loader       Loader
-	inflector    internal.Inflector
-	templatePath string
-
-	// files is a map of filenames to open file handles.
-	files map[string]*os.File
-
-	// generated is the generated templates after a run.
-	generated []TBuf
-
+	loader            Loader
+	inflector         internal.Inflector
 	packageName       string
 	tags              string
 	customTypePackage string
 	filenameSuffix    string
-	singleFile        bool
 	filename          string
-	path              string
+	baseDir           string
+	tempDir           string
+	disableFormat     bool
 
+	headerModule  module.Module
+	globalModules []module.Module
+	typeModules   []module.Module
+
+	files              map[string]*FileBuffer
 	nameConflictSuffix string
 }
 
 func (g *Generator) newTemplateSet() *templateSet {
 	return &templateSet{
 		funcs: g.newTemplateFuncs(),
-		l:     g.templateLoader,
-		tpls:  map[string]*template.Template{},
 	}
 }
 
-// TemplateLoader loads templates from the specified name.
-func (g *Generator) templateLoader(name string) ([]byte, error) {
-	// no template path specified
-	if g.templatePath == "" {
-		f, err := templates.Assets.Open(name)
-		if err != nil {
-			return nil, err
-		}
-		return ioutil.ReadAll(f)
+func (g *Generator) Generate(schema *models.Schema) error {
+	tempDir, err := ioutil.TempDir("", "yo_")
+	if err != nil {
+		return fmt.Errorf("failed to create temp dir: %v", err)
 	}
 
-	return ioutil.ReadFile(path.Join(g.templatePath, name))
-}
+	// create a workspace for the code generation and cleanup it after done
+	g.tempDir = tempDir
+	defer os.RemoveAll(g.tempDir)
 
-func (g *Generator) Generate(tableMap map[string]*internal.Type, ixMap map[string]*internal.Index) error {
-	// generate table templates
-	for _, t := range tableMap {
-		if err := g.ExecuteTemplate(TypeTemplate, t.Name, "", t); err != nil {
-			return err
-		}
-	}
-
-	// generate index templates
-	for _, ix := range ixMap {
-		if err := g.ExecuteTemplate(IndexTemplate, ix.Type.Name, ix.Index.IndexName, ix); err != nil {
-			return err
+	// execute type modules
+	for _, mod := range g.typeModules {
+		for _, tbl := range schema.Types {
+			if err := g.ExecuteTemplate(mod, tbl.Name, tbl); err != nil {
+				return err
+			}
 		}
 	}
 
 	ds := &basicDataSet{
+		BuildTag: g.tags,
 		Package:  g.packageName,
-		TableMap: tableMap,
+		Schema:   schema,
 	}
 
-	if err := g.ExecuteTemplate(YOTemplate, "yo_db", "", ds); err != nil {
-		return err
+	// execute global modules
+	for _, mod := range g.globalModules {
+		if err := g.ExecuteTemplate(mod, mod.Name(), ds); err != nil {
+			return err
+		}
 	}
 
-	if err := g.writeTypes(ds); err != nil {
+	if err := g.writeFiles(ds); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-// getFile builds the filepath from the TBuf information, and retrieves the
-// file from files. If the built filename is not already defined, then it calls
-// the os.OpenFile with the correct parameters depending on the state of args.
-func (g *Generator) getFile(ds *basicDataSet, t *TBuf) (*os.File, error) {
-	// determine filename
-	var filename = strings.ToLower(t.Name) + g.filenameSuffix
-	if g.singleFile {
-		filename = g.filename
-	}
-	filename = path.Join(g.path, filename)
+func (g *Generator) getFile(name string) *FileBuffer {
+	var filename = internal.CamelToScake(name) + g.filenameSuffix
+	filename = path.Join(g.baseDir, filename)
 
-	// lookup file
 	f, ok := g.files[filename]
 	if ok {
-		return f, nil
+		return f
 	}
 
-	// default open mode
-	mode := os.O_RDWR | os.O_CREATE | os.O_TRUNC
-
-	// stat file to determine if file already exists
-	fi, err := os.Stat(filename)
-	if err == nil && fi.IsDir() {
-		return nil, errors.New("filename cannot be directory")
+	file := &FileBuffer{
+		FileName: filename,
+		BaseName: name,
+		TempDir:  g.tempDir,
 	}
 
-	// skip
-	if t.TemplateType == YOTemplate && fi != nil {
-		return nil, nil
-	}
-
-	// open file
-	f, err = os.OpenFile(filename, mode, 0666)
-	if err != nil {
-		return nil, err
-	}
-
-	// add build tags
-	if g.tags != "" {
-		_, _ = f.WriteString(`// +build ` + g.tags + "\n\n")
-	}
-
-	// execute
-	if err := g.newTemplateSet().Execute(f, "yo_package.go.tpl", ds); err != nil {
-		return nil, err
-	}
-
-	// store file
-	g.files[filename] = f
-
-	return f, nil
+	g.files[filename] = file
+	return file
 }
 
-// importsOptions is the same as x/tools/cmd/goimports options except Fragment.
-var importsOptions = &imports.Options{
-	TabWidth:  8,
-	TabIndent: true,
-	Comments:  true,
-}
-
-// writeTypes writes the generated definitions.
-func (g *Generator) writeTypes(ds *basicDataSet) error {
-	var err error
-
-	out := TBufSlice(g.generated)
-
-	// sort segments
-	sort.Sort(out)
-
-	// loop, writing in order
-	for _, t := range out {
-		// check if generated template is only whitespace/empty
-		bufStr := strings.TrimSpace(t.Buf.String())
-		if len(bufStr) == 0 {
-			continue
-		}
-
-		var f *os.File
-		// get file and filename
-		f, err = g.getFile(ds, &t)
-		if err != nil {
+// writeFiles writes the generated definitions.
+func (g *Generator) writeFiles(ds *basicDataSet) error {
+	for _, file := range g.files {
+		if err := g.ExecuteHeaderTemplate(g.headerModule, file, ds); err != nil {
 			return err
 		}
 
-		// should only be nil when type == yo
-		if f == nil {
-			continue
-		}
-
-		// write segment
-		if _, err = t.Buf.WriteTo(f); err != nil {
+		if err := file.WriteTempFile(); err != nil {
 			return err
 		}
 	}
 
-	// format by imports, closing files
-	for k, f := range g.files {
-		// close
-		err = f.Close()
-		if err != nil {
+	for _, file := range g.files {
+		if err := file.Postprocess(g.disableFormat); err != nil {
 			return err
 		}
+	}
 
-		// imports.Process needs absolute filepath for accurate fix
-		abs, err := filepath.Abs(k)
-		if err != nil {
-			return err
-		}
-		// format
-		formatted, err := imports.Process(abs, nil, importsOptions)
-		if err != nil {
-			return err
-		}
-
-		// since abs file exists, set perm to 0
-		if err := ioutil.WriteFile(abs, formatted, 0); err != nil {
+	for _, file := range g.files {
+		if err := file.Finalize(); err != nil {
 			return err
 		}
 	}
@@ -272,31 +182,29 @@ func (g *Generator) writeTypes(ds *basicDataSet) error {
 
 // ExecuteTemplate loads and parses the supplied template with name and
 // executes it with obj as the context.
-func (g *Generator) ExecuteTemplate(tt TemplateType, name string, sub string, obj interface{}) error {
-	var err error
-
-	// setup generated
-	if g.generated == nil {
-		g.generated = []TBuf{}
+func (g *Generator) ExecuteTemplate(mod module.Module, name string, obj interface{}) error {
+	file := g.getFile(name)
+	tbuf := TBuf{
+		Name: name,
+		Buf:  new(bytes.Buffer),
 	}
-
-	// create store
-	v := TBuf{
-		TemplateType: tt,
-		Name:         name,
-		Subname:      sub,
-		Buf:          new(bytes.Buffer),
-	}
-
-	// build template name
-	templateName := fmt.Sprintf("%s.go.tpl", tt)
 
 	// execute template
-	err = g.newTemplateSet().Execute(v.Buf, templateName, obj)
-	if err != nil {
+	if err := g.newTemplateSet().Execute(tbuf.Buf, mod, obj); err != nil {
+		return fmt.Errorf("error happened while executing template: %v", err)
+	}
+
+	file.Chunks = append(file.Chunks, &tbuf)
+	return nil
+}
+
+func (g *Generator) ExecuteHeaderTemplate(mod module.Module, file *FileBuffer, obj interface{}) error {
+	buf := new(bytes.Buffer)
+
+	if err := g.newTemplateSet().Execute(buf, mod, obj); err != nil {
 		return err
 	}
 
-	g.generated = append(g.generated, v)
+	file.Header = buf.Bytes()
 	return nil
 }

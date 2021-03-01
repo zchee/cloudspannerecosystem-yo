@@ -20,17 +20,90 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
+	"os"
+	pathpkg "path"
+	"path/filepath"
+	"time"
 
 	"github.com/spf13/cobra"
-	"go.mercari.io/yo/generator"
-	"go.mercari.io/yo/internal"
-	"go.mercari.io/yo/loaders"
+	"go.mercari.io/yo/v2/config"
+	"go.mercari.io/yo/v2/generator"
+	"go.mercari.io/yo/v2/internal"
+	"go.mercari.io/yo/v2/loader"
+	"go.mercari.io/yo/v2/module"
+	"go.mercari.io/yo/v2/module/builtin"
 )
 
 var (
-	generateOpts = internal.ArgType{}
-	generateCmd  = &cobra.Command{
+	defaultHeaderModule  = builtin.Header
+	defaultGlobalModules = []module.Module{builtin.Interface}
+	defaultTypeModules   = []module.Module{builtin.Type, builtin.Operation}
+)
+
+// generateCmdOption is the type that specifies the command line arguments.
+type generateCmdOption struct {
+	// Project is the GCP project string
+	Project string
+
+	// Instance is the instance string
+	Instance string
+
+	// Database is the database string
+	Database string
+
+	// Out is the output path. If Out is a file, then that will be used as the
+	// path. If Out is a directory, then the output file will be
+	// Out/<$CWD>.yo.go
+	Out string
+
+	// Suffix is the output suffix for filenames.
+	Suffix string
+
+	// Package is the name used to generate package headers. If not specified,
+	// the name of the output directory will be used instead.
+	Package string
+
+	// Tags is the list of build tags to add to generated Go files.
+	Tags string
+
+	// DDLFilepath is the filepath of the ddl file.
+	DDLFilepath string
+
+	// FromDDL indicates generating from ddl flie or not.
+	FromDDL bool
+
+	// IgnoreFields allows the user to specify field names which should not be
+	// handled by yo in the generated code.
+	IgnoreFields []string
+
+	// IgnoreTables allows the user to specify table names which should not be
+	// handled by yo in the generated code.
+	IgnoreTables []string
+
+	// Path to config file
+	ConfigFile string
+
+	// DisableDefaultModules disable to use the default modules for code generation
+	DisableDefaultModules bool
+
+	// DisableFormat disable to apply gofmt to generated files
+	DisableFormat bool
+
+	HeaderModule            string
+	AdditionalGlobalModules []string
+	AdditionalTypeModules   []string
+
+	// UseLegacyIndexModule uses legacy index module instead of the default index module
+	UseLegacyIndexModule bool
+
+	baseDir string
+}
+
+var (
+	generateCmdOpts = generateCmdOption{}
+	generateCmd     = &cobra.Command{
 		Use:   "generate",
 		Short: "yo generate generates Go code from ddl file.",
 		Args: func(cmd *cobra.Command, args []string) error {
@@ -52,54 +125,66 @@ var (
   yo generate $SPANNER_PROJECT_NAME $SPANNER_INSTANCE_NAME $SPANNER_DATABASE_NAME -o models --custom-types-file custom_column_types.yml
 `,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := processArgs(&generateOpts, args); err != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+
+			cfg, err := config.Load(generateCmdOpts.ConfigFile)
+			if err != nil {
 				return err
 			}
 
-			inflector, err := internal.NewInflector(generateOpts.InflectionRuleFile)
+			if err := processGenerateCmdOption(&generateCmdOpts, args); err != nil {
+				return err
+			}
+
+			inflector, err := internal.NewInflector(cfg.Inflections)
 			if err != nil {
 				return fmt.Errorf("load inflection rule failed: %v", err)
 			}
-			var loader *internal.TypeLoader
-			if generateOpts.FromDDL {
-				spannerLoader, err := loaders.NewSpannerLoaderFromDDL(args[0])
+
+			var source loader.SchemaSource
+			if generateCmdOpts.FromDDL {
+				source, err = loader.NewSchemaParserSource(generateCmdOpts.DDLFilepath)
 				if err != nil {
-					return fmt.Errorf("error: %v", err)
+					return fmt.Errorf("failed to create spanner loader: %v", err)
 				}
-				loader = internal.NewTypeLoader(spannerLoader, inflector)
 			} else {
-				spannerClient, err := connectSpanner(&rootOpts)
+				spannerClient, err := connectSpanner(ctx, generateCmdOpts.Project, generateCmdOpts.Instance, generateCmdOpts.Database)
 				if err != nil {
-					return fmt.Errorf("error: %v", err)
+					return fmt.Errorf("failed to connect spanner: %v", err)
 				}
-				spannerLoader := loaders.NewSpannerLoader(spannerClient)
-				loader = internal.NewTypeLoader(spannerLoader, inflector)
+				source, err = loader.NewInformationSchemaSource(spannerClient)
+				if err != nil {
+					return fmt.Errorf("failed to create spanner loader: %v", err)
+				}
 			}
 
-			// load custom type definitions
-			if generateOpts.CustomTypesFile != "" {
-				if err := loader.LoadCustomTypes(generateOpts.CustomTypesFile); err != nil {
-					return fmt.Errorf("load custom types file failed: %v", err)
-				}
-			}
+			typeLoader := loader.NewTypeLoader(source, inflector, loader.Option{
+				Config:       cfg,
+				IgnoreTables: generateCmdOpts.IgnoreTables,
+				IgnoreFields: generateCmdOpts.IgnoreFields,
+			})
 
 			// load defs into type map
-			tableMap, ixMap, err := loader.LoadSchema(&generateOpts)
+			schema, err := typeLoader.LoadSchema()
 			if err != nil {
 				return fmt.Errorf("error: %v", err)
 			}
 
-			g := generator.NewGenerator(loader, inflector, generator.GeneratorOption{
-				PackageName:       generateOpts.Package,
-				Tags:              generateOpts.Tags,
-				TemplatePath:      generateOpts.TemplatePath,
-				CustomTypePackage: generateOpts.CustomTypePackage,
-				FilenameSuffix:    generateOpts.Suffix,
-				SingleFile:        generateOpts.SingleFile,
-				Filename:          generateOpts.Filename,
-				Path:              generateOpts.Path,
+			headerModule, globalModules, typeModules := decideModules(&generateCmdOpts)
+
+			g := generator.NewGenerator(typeLoader, inflector, generator.GeneratorOption{
+				PackageName:    generateCmdOpts.Package,
+				Tags:           generateCmdOpts.Tags,
+				FilenameSuffix: generateCmdOpts.Suffix,
+				BaseDir:        generateCmdOpts.baseDir,
+				DisableFormat:  generateCmdOpts.DisableFormat,
+
+				HeaderModule:  headerModule,
+				GlobalModules: globalModules,
+				TypeModules:   typeModules,
 			})
-			if err := g.Generate(tableMap, ixMap); err != nil {
+			if err := g.Generate(schema); err != nil {
 				return fmt.Errorf("error: %v", err)
 			}
 
@@ -109,7 +194,118 @@ var (
 )
 
 func init() {
-	generateCmd.Flags().BoolVar(&generateOpts.FromDDL, "from-ddl", false, "toggle using ddl file")
-	setRootOpts(generateCmd, &generateOpts)
+	generateCmd.Flags().StringVarP(&generateCmdOpts.ConfigFile, "config", "c", "", "path to Yo config file")
+	generateCmd.Flags().BoolVar(&generateCmdOpts.FromDDL, "from-ddl", false, "toggle using ddl file")
+	generateCmd.Flags().StringVarP(&generateCmdOpts.Out, "out", "o", "", "output path or file name")
+	generateCmd.Flags().StringVar(&generateCmdOpts.Suffix, "suffix", defaultSuffix, "output file suffix")
+	generateCmd.Flags().StringVarP(&generateCmdOpts.Package, "package", "p", "", "package name used in generated Go code")
+	generateCmd.Flags().StringArrayVar(&generateCmdOpts.IgnoreFields, "ignore-fields", nil, "fields to exclude from the generated Go code types")
+	generateCmd.Flags().StringArrayVar(&generateCmdOpts.IgnoreTables, "ignore-tables", nil, "tables to exclude from the generated Go code types")
+	generateCmd.Flags().StringVar(&generateCmdOpts.Tags, "tags", "", "build tags to add to package header")
+	generateCmd.Flags().BoolVar(&generateCmdOpts.DisableDefaultModules, "disable-default-modules", false, "disable the default modules for code generation")
+	generateCmd.Flags().BoolVar(&generateCmdOpts.DisableFormat, "disable-format", false, "disable to apply gofmt to generated files")
+	generateCmd.Flags().StringVar(&generateCmdOpts.HeaderModule, "header-module", "", "replace the default header module by user defined module")
+	generateCmd.Flags().StringArrayVar(&generateCmdOpts.AdditionalGlobalModules, "global-module", nil, "add user defined module to global modules")
+	generateCmd.Flags().StringArrayVar(&generateCmdOpts.AdditionalTypeModules, "type-module", nil, "add user defined module to type modules")
+	generateCmd.Flags().BoolVar(&generateCmdOpts.UseLegacyIndexModule, "use-legacy-index-module", false, "use legacy index func name")
+
+	helpFn := generateCmd.HelpFunc()
+	generateCmd.SetHelpFunc(func(cmd *cobra.Command, args []string) {
+		helpFn(cmd, args)
+		os.Exit(1)
+	})
+
 	rootCmd.AddCommand(generateCmd)
+}
+
+func processGenerateCmdOption(opts *generateCmdOption, argv []string) error {
+	if len(argv) == 3 {
+		opts.Project = argv[0]
+		opts.Instance = argv[1]
+		opts.Database = argv[2]
+	} else {
+		opts.DDLFilepath = argv[0]
+	}
+
+	path := ""
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+
+	// determine out path
+	if opts.Out == "" {
+		path = cwd
+	} else {
+		// determine what to do with Out
+		fi, err := os.Stat(opts.Out)
+		if err != nil {
+			return err
+		}
+		if fi.IsDir() {
+			// out is directory
+			path = opts.Out
+		} else {
+			return fmt.Errorf("output path must be a directory")
+		}
+	}
+
+	// fix path
+	if path == "." {
+		path = cwd
+	}
+
+	// determine package name
+	if opts.Package == "" {
+		opts.Package = pathpkg.Base(path)
+	}
+
+	opts.baseDir = path
+
+	return nil
+}
+
+func decideModules(opts *generateCmdOption) (module.Module, []module.Module, []module.Module) {
+	// header module uses null module that generates nothing when disabling default
+	headerModule := builtin.NullHeader
+	var globalModules []module.Module
+	var typeModules []module.Module
+
+	if !generateCmdOpts.DisableDefaultModules {
+		headerModule = defaultHeaderModule
+		globalModules = defaultGlobalModules
+		typeModules = defaultTypeModules
+		if generateCmdOpts.UseLegacyIndexModule {
+			typeModules = append(typeModules, builtin.LegacyIndex)
+		} else {
+			typeModules = append(typeModules, builtin.Index)
+		}
+	}
+
+	for _, path := range generateCmdOpts.AdditionalGlobalModules {
+		basename := filepath.Base(path)
+		for i := 0; i < 3; i++ {
+			basename = basename[:len(basename)-len(filepath.Ext(basename))]
+		}
+		globalModules = append(globalModules, module.New(module.GlobalModule, basename, path))
+	}
+
+	for _, path := range generateCmdOpts.AdditionalTypeModules {
+		basename := filepath.Base(path)
+		for i := 0; i < 3; i++ {
+			basename = basename[:len(basename)-len(filepath.Ext(basename))]
+		}
+		typeModules = append(typeModules, module.New(module.TypeModule, basename, path))
+	}
+
+	if path := generateCmdOpts.HeaderModule; path != "" {
+		basename := filepath.Base(path)
+		for i := 0; i < 3; i++ {
+			basename = basename[:len(basename)-len(filepath.Ext(basename))]
+		}
+		headerModule = module.New(module.HeaderModule, basename, path)
+	}
+
+	return headerModule, globalModules, typeModules
 }

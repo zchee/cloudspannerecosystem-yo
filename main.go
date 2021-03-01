@@ -23,7 +23,7 @@ import (
 	"fmt"
 	"os"
 
-	"go.mercari.io/yo/cmd"
+	"go.mercari.io/yo/v2/cmd"
 )
 
 func main() {

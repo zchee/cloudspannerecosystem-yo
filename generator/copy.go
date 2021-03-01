@@ -24,7 +24,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"go.mercari.io/yo/tplbin"
+	"go.mercari.io/yo/v2/module/builtin/tplbin"
 )
 
 // CopyDefaultTemplates copies default templete files to dir.
